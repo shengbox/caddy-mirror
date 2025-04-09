@@ -2,8 +2,12 @@ package mirror
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -11,39 +15,48 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// Mirror 是我们的模块结构体
 type Mirror struct {
-	MirrorTo string `json:"mirror_to,omitempty"` // 镜像目标地址
+	MirrorTo  string `json:"mirror_to,omitempty"`
+	mirrorURL *url.URL
 }
 
-// CaddyModule 返回模块信息
 func (Mirror) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.mirror", // 模块的唯一标识
+		ID:  "http.handlers.mirror",
 		New: func() caddy.Module { return new(Mirror) },
 	}
 }
 
-// Provision 设置模块（初始化）
 func (d *Mirror) Provision(ctx caddy.Context) error {
-	// 这里可以添加初始化逻辑，目前为空
+	input := strings.TrimSpace(d.MirrorTo)
+	if input == "" {
+		return errors.New("mirror_to must not be empty")
+	}
+	// 智能协议处理
+	if !strings.Contains(input, "://") {
+		input = "http://" + input // 默认使用HTTP协议
+	}
+	// 严格验证URL合法性
+	u, err := url.Parse(input)
+	if err != nil {
+		return fmt.Errorf("invalid mirror_to URL: %w", err)
+	}
+	d.mirrorURL = u
 	return nil
 }
 
-// ServeHTTP 实现中间件逻辑
-func (d Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// 异步复制请求到 MirrorTo
+func (m Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+
 	go func(req *http.Request) {
 		// 创建一个新的请求副本
-
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
-			return // 忽略错误，避免影响主请求
+			return
 		}
 
+		dest := m.mirrorURL.ResolveReference(req.URL).String()
 		req.Body = io.NopCloser(bytes.NewBuffer(body))
-
-		mirrorReq, err := http.NewRequest(req.Method, "http://"+d.MirrorTo+req.RequestURI, bytes.NewBuffer(body))
+		mirrorReq, err := http.NewRequest(req.Method, dest, bytes.NewBuffer(body))
 		if err != nil {
 			return // 忽略错误，避免影响主请求
 		}
@@ -55,16 +68,13 @@ func (d Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 			}
 		}
 
-		// 发送镜像请求
 		client := &http.Client{}
-		_, _ = client.Do(mirrorReq) // 忽略响应，避免阻塞
+		_, _ = client.Do(mirrorReq)
 	}(r)
 
-	// 主请求继续处理
 	return next.ServeHTTP(w, r)
 }
 
-// UnmarshalCaddyfile 从 Caddyfile 解析配置
 func (d *Mirror) UnmarshalCaddyfile(disp *caddyfile.Dispenser) error {
 	for disp.Next() {
 		if disp.NextArg() {
@@ -74,7 +84,6 @@ func (d *Mirror) UnmarshalCaddyfile(disp *caddyfile.Dispenser) error {
 	return nil
 }
 
-// 接口实现
 var (
 	_ caddyhttp.MiddlewareHandler = (*Mirror)(nil)
 	_ caddy.Provisioner           = (*Mirror)(nil)
@@ -83,7 +92,6 @@ var (
 
 func init() {
 	caddy.RegisterModule(Mirror{})
-
 	httpcaddyfile.RegisterHandlerDirective("mirror", func(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 		var d Mirror
 		d.UnmarshalCaddyfile(h.Dispenser)
